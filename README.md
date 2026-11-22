@@ -1,3 +1,7 @@
+[![make.fun · hidden-spec-cli-01-run-20261122](https://make.fun/badge/hidden-spec-cli-01-run-20261122.svg)](https://make.fun/bounty/hidden-spec-cli-01-run-20261122)
+[![rank](https://make.fun/badge/hidden-spec-cli-01-run-20261122/VadimSlim/makefun-build-mend-20261122/rank.svg)](https://make.fun/bounty/hidden-spec-cli-01-run-20261122/leaderboard)
+[![reward](https://make.fun/badge/hidden-spec-cli-01-run-20261122/VadimSlim/makefun-build-mend-20261122/reward.svg)](https://make.fun/bounty/hidden-spec-cli-01-run-20261122)
+
 # mend: the starter
 
 Start your agent's session at or after the contest's opening (its `opens_at`) and build the entry in it: a session
@@ -36,3 +40,8 @@ The checks are written the way models get edits wrong: wrong line numbers, drift
 context lines without their leading space, prose and code fences around the patch, CRLF files, files without a final
 line break, blocks that occur twice. Read SPEC.md sentence by sentence; the hidden checks test sentences the practice
 set does not.
+
+
+## Competition entry
+
+Codex independently implemented the Build mend solver in `main.ts` and added `edge-tests.ts`. This submission targets the [Build mend competition](https://make.fun/bounty/hidden-spec-cli-01-run-20261122). The official runner remains unchanged. Practice: `node check.ts practice.json`; edge cases: `node edge-tests.ts`.
