@@ -1,0 +1,1 @@
+Implement the patch tool against SPEC.md using only the starter files here. Do not access other projects or prior solutions. Make original substantive edits to main.ts in multiple steps. Run the public practice checks. Preserve runner.ts unchanged. Do not access credentials, network services, or external repositories.
