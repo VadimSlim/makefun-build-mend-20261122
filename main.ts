@@ -1,8 +1,5 @@
-// main.ts is mend, the CLI SPEC.md specifies, and this is the kit's starting point for it (MIT). It does sections 1 to 4, 9 and 10 of SPEC.md: the command line, the output and
-// exit codes, safe paths, format detection, JSON edits and the all-or-nothing write. The other three formats are
-// detected and then read as holding no edit, so they answer `error: parse 1`: reading unified diffs (section 6),
-// SEARCH/REPLACE blocks (section 7) and V4A patches (section 8), and matching lines at three tiers (section 5), are
-// yours to write. Node 22, the standard library alone; run it as `node main.ts [options] [PATCH]`.
+// mend: the four-format, transactional patch CLI described by SPEC.md (MIT).
+// Node 22 and its standard library alone; run as node main.ts [options] [PATCH].
 //
 // In a trial the grader runs `node /bot/main.ts` with MAKEFUN_ENV_URL set, and then this file hands over to runner.ts
 // (the last lines below): keep that hand-over and runner.ts as they are, and write the CLI.
@@ -42,6 +39,7 @@ function safe(p: string): boolean {
 
 /** The tree as the edits leave it: changed paths in `now` (null: deleted), the rest read from disk. */
 class Tree {
+  readonly moves: [string, string][] = [];
   private readonly orig = new Map<string, string | null>();
   readonly now = new Map<string, string | null>();
   original(p: string): string | null {
@@ -62,6 +60,232 @@ class Tree {
 }
 
 type Edit = (tree: Tree) => void;
+
+type Body = { kind: string; text: string };
+type Chunk = { body: Body[]; a?: number; anchor?: string; eof?: boolean };
+function fileLines(text: string) {
+  const i = text.indexOf('\n');
+  const br = i > 0 && text[i - 1] === '\r' ? '\r\n' : '\n';
+  const final = text !== '' && text.endsWith(br);
+  const lines = text === '' ? [] : text.split(br);
+  if (final) lines.pop();
+  return { lines, br, final };
+}
+const serialize = (f: ReturnType<typeof fileLines>) => f.lines.length ? f.lines.join(f.br) + (f.final ? f.br : '') : '';
+const parseFault = (i: number): never => { throw new Exit2(`error: parse ${i + 1}`); };
+function occurrences(lines: string[], old: string[], strict: boolean, from = 0, eof = false): { positions: number[]; tier: number } {
+  for (let tier = 0; tier <= (strict ? 0 : 2); tier++) {
+    const norm = (s: string) => tier === 0 ? s : tier === 1 ? s.replace(/[ \t]+$/, '') : s.replace(/^[ \t]+|[ \t]+$/g, '');
+    const positions: number[] = [];
+    for (let i = from; i + old.length <= lines.length; i++) {
+      if (eof && i + old.length !== lines.length) continue;
+      if (old.every((s, k) => norm(s) === norm(lines[i + k]!))) positions.push(i);
+    }
+    if (positions.length) return { positions, tier };
+  }
+  return { positions: [], tier: 0 };
+}
+function replacement(body: Body[], matched: string[], tier: number): string[] {
+  const old = body.filter(b => b.kind === ' ' || b.kind === '-');
+  const p = old[0]?.text.match(/^[ \t]*/)?.[0] ?? '';
+  const f = matched[0]?.match(/^[ \t]*/)?.[0] ?? '';
+  let k = 0;
+  const out: string[] = [];
+  for (const b of body) {
+    if (b.kind === ' ') out.push(matched[k++]!);
+    else if (b.kind === '-') k++;
+    else if (b.kind === '+') out.push(tier === 2 && !blank(b.text) && b.text.startsWith(p) ? f + b.text.slice(p.length) : b.text);
+  }
+  return out;
+}
+function requirePath(tree: Tree, p: string): string {
+  const text = tree.get(p);
+  if (text === null) throw new Fail('missing', p);
+  return text;
+}
+function pathsSafe(...paths: string[]) {
+  for (const p of paths) if (!safe(p)) throw new Fail('unsafe', p);
+}
+function searchEdits(lines: string[], strict: boolean): Edit[] {
+  const edits: Edit[] = [];
+  let previous = '', end = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i]!.trimEnd() !== '<<<<<<< SEARCH') continue;
+    let p = previous;
+    for (let j = i - 1; j > end; j--) {
+      if (!blank(lines[j]!) && !lines[j]!.trim().startsWith('```')) { p = lines[j]!.trim(); break; }
+    }
+    if (!p) parseFault(i);
+    let mid = i + 1;
+    while (mid < lines.length && lines[mid]!.trimEnd() !== '=======') mid++;
+    let last = mid + 1;
+    while (last < lines.length && lines[last]!.trimEnd() !== '>>>>>>> REPLACE') last++;
+    if (last >= lines.length) parseFault(i);
+    const old = lines.slice(i + 1, mid), add = lines.slice(mid + 1, last);
+    edits.push(tree => {
+      pathsSafe(p);
+      if (!old.length) {
+        if (tree.get(p) !== null) throw new Fail('exists', p);
+        tree.now.set(p, add.length ? add.join('\n') + '\n' : '');
+        return;
+      }
+      const f = fileLines(requirePath(tree, p));
+      const m = occurrences(f.lines, old, strict);
+      if (!m.positions.length) throw new Fail('no-match', p);
+      if (m.positions.length > 1) throw new Fail('ambiguous', p);
+      const at = m.positions[0]!;
+      const body = [...old.map(text => ({kind: '-', text})), ...add.map(text => ({kind: '+', text}))];
+      f.lines.splice(at, old.length, ...replacement(body, f.lines.slice(at, at + old.length), m.tier));
+      tree.now.set(p, serialize(f));
+    });
+    previous = p; end = last; i = last;
+  }
+  return edits;
+}
+
+function sectionEdit(p: string, dest: string, mode: string, chunks: Chunk[], unified: boolean, strict: boolean, explicitMove = false): Edit {
+  return tree => {
+    pathsSafe(...(mode === 'add' ? [...(p ? [p] : []), dest] : mode === 'delete' ? [p, ...(dest ? [dest] : [])] : [p, dest]));
+    if (mode === 'add') {
+      if (tree.get(dest) !== null) throw new Fail('exists', dest);
+      const body = chunks.flatMap(c => c.body);
+      const add = body.filter(b => b.kind === '+').map(b => b.text);
+      const last = body.map(b => b.kind).lastIndexOf('+');
+      tree.now.set(dest, add.length ? add.join('\n') + (unified && body[last + 1]?.kind === '\\' ? '' : '\n') : '');
+      return;
+    }
+    const f = fileLines(requirePath(tree, p));
+    if (mode === 'delete') { tree.now.set(p, null); return; }
+    if ((dest !== p || explicitMove) && tree.get(dest) !== null) throw new Fail('exists', dest);
+    let cursor = 0, delta = 0;
+    for (const c of chunks) {
+      if (!unified && c.anchor) {
+        const m = occurrences(f.lines, [c.anchor], strict, cursor);
+        if (!m.positions.length) throw new Fail('no-match', p);
+        cursor = m.positions[0]! + 1;
+      }
+      const old = c.body.filter(b => b.kind === ' ' || b.kind === '-').map(b => b.text);
+      let at: number, tier = 0;
+      if (!old.length) at = unified ? Math.max(0, Math.min(f.lines.length, c.a! + delta)) : c.eof ? f.lines.length : cursor;
+      else {
+        const m = occurrences(f.lines, old, strict, unified ? 0 : cursor, !unified && c.eof);
+        if (!m.positions.length) throw new Fail('no-match', p);
+        tier = m.tier;
+        at = unified ? m.positions.reduce((best, x) => Math.abs(x - (c.a! - 1 + delta)) < Math.abs(best - (c.a! - 1 + delta)) ? x : best) : m.positions[0]!;
+      }
+      const add = replacement(c.body, f.lines.slice(at, at + old.length), tier);
+      if (unified && at + old.length === f.lines.length) {
+        let last = -1;
+        c.body.forEach((b, i) => { if (b.kind === ' ' || b.kind === '+') last = i; });
+        f.final = !(last >= 0 && c.body[last + 1]?.kind === '\\');
+      }
+      f.lines.splice(at, old.length, ...add);
+      delta += add.length - old.length;
+      cursor = at + add.length;
+    }
+    tree.now.set(dest, serialize(f));
+    if (dest !== p) { tree.now.set(p, null); tree.moves.push([p, dest]); }
+  };
+}
+
+function unifiedEdits(lines: string[], strict: boolean): Edit[] {
+  const edits: Edit[] = [];
+  let section: { p: string; dest: string; mode: string; chunks: Chunk[]; pair: boolean } | null = null;
+  const flush = () => {
+    if (section) edits.push(sectionEdit(section.p, section.dest, section.mode, section.chunks, true, strict));
+  };
+  const path = (s: string) => s.split('\t')[0]!.trim().replace(/^[ab]\//, '');
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i]!;
+    if (l.startsWith('diff --git ')) {
+      const m = /^diff --git a\/(.+) b\/(.+)$/.exec(l);
+      if (!m) parseFault(i);
+      flush(); section = {p: m![1]!, dest: m![2]!, mode: '', chunks: [], pair: false};
+    } else if (l.startsWith('--- ')) {
+      if (!(lines[i + 1] ?? '').startsWith('+++ ')) { if (section && !section.chunks.length) parseFault(i + 1); continue; }
+      if (!section || section.chunks.length || section.pair) {
+        flush(); section = {p: '', dest: '', mode: '', chunks: [], pair: false};
+      }
+      const old = l.slice(4).split('\t')[0]!.trim(), next = lines[++i]!.slice(4).split('\t')[0]!.trim();
+      section.p = old === '/dev/null' ? '' : path(old);
+      section.dest = next === '/dev/null' ? '' : path(next);
+      section.pair = true;
+      if (old === '/dev/null') section.mode = 'add';
+      else if (next === '/dev/null') section.mode = 'delete';
+    } else if (l.startsWith('@@')) {
+      const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(?:.*)$/.exec(l);
+      if (!m || !section) parseFault(i);
+      const body: Body[] = [];
+      while (i + 1 < lines.length) {
+        const s = lines[i + 1]!;
+        if (s.startsWith('diff --git ') || (s.startsWith('--- ') && (lines[i + 2] ?? '').startsWith('+++ '))) break;
+        if (s !== '' && !' +-\\'.includes(s[0]!)) break;
+        i++; body.push({kind: s === '' ? ' ' : s[0]!, text: s === '' ? '' : s.slice(1)});
+      }
+      // Only physically empty trailing body lines are excluded, not explicit context lines.
+      while (body.length && lines[i] === '') { body.pop(); i--; }
+      section!.chunks.push({a: Number(m![1]), body});
+    } else if (section && !section.chunks.length) {
+      if (l.startsWith('new file mode')) section.mode = 'add';
+      else if (l.startsWith('deleted file mode')) section.mode = 'delete';
+      else if (!section.pair && l.startsWith('rename from ')) section.p = l.slice(12).trim();
+      else if (!section.pair && l.startsWith('rename to ')) section.dest = l.slice(10).trim();
+    }
+  }
+  flush(); return edits;
+}
+
+function v4aEdits(lines: string[], strict: boolean): Edit[] {
+  const first = lines.findIndex(l => !blank(l));
+  if (first < 0) parseFault(0);
+  if (lines[first]!.trim() !== '*** Begin Patch') parseFault(first);
+  let end = lines.length - 1;
+  while (end >= 0 && blank(lines[end]!)) end--;
+  if (lines[end]?.trim() !== '*** End Patch') parseFault(lines.length);
+  const edits: Edit[] = [];
+  for (let i = first + 1; i < end;) {
+    if (blank(lines[i]!)) { i++; continue; }
+    const start = i, m = /^\*\*\* (Add|Delete|Update) File: (.*)$/.exec(lines[i]!);
+    if (!m) parseFault(i);
+    const mode = m![1] === 'Add' ? 'add' : m![1] === 'Delete' ? 'delete' : '';
+    const p = m![2]!.trim(); let dest = p, moved = false;
+    let stop = i + 1;
+    while (stop < end && !/^\*\*\* (?:Add|Delete|Update) File: /.test(lines[stop]!)) stop++;
+    let tail = stop;
+    while (tail > i + 1 && blank(lines[tail - 1]!)) tail--;
+    i++;
+    const chunks: Chunk[] = [];
+    if (mode === 'add') {
+      const body: Body[] = [];
+      for (; i < tail; i++) {
+        if (lines[i] !== '' && !lines[i]!.startsWith('+')) parseFault(i);
+        body.push({kind: '+', text: lines[i]!.slice(1)});
+      }
+      chunks.push({body});
+    } else if (mode === 'delete') { if (i < tail) parseFault(i); }
+    else {
+      let current: Chunk | null = null;
+      if (i < tail && lines[i]!.startsWith('*** Move to: ')) { dest = lines[i++]!.slice(13).trim(); moved = true; }
+      for (; i < tail; i++) {
+        const s = lines[i]!;
+        if (s.startsWith('@@')) { current = {body: [], anchor: s.slice(2).trim()}; chunks.push(current); }
+        else if (s === '*** End of File') {
+          if (!current) parseFault(i);
+          current!.eof = true; current = null;
+        } else if (s === '' || ' +-'.includes(s[0]!)) {
+          if (!current) {
+            if (chunks.length) parseFault(i);
+            current = {body: []}; chunks.push(current);
+          }
+          current.body.push({kind: s === '' ? ' ' : s[0]!, text: s.slice(1)});
+        } else parseFault(i);
+      }
+      if (!chunks.length && !moved) parseFault(start);
+    }
+    edits.push(sectionEdit(p, dest, mode, chunks, false, strict, moved)); i = stop;
+  }
+  return edits;
+}
 
 function detect(lines: string[]): string | null {
   const first = lines.findIndex((l) => !blank(l));
@@ -192,7 +416,7 @@ function run(args: string[]): { code: number; out: string[] } {
   if (kind === null) return { code: 2, out: ['error: format'] };
   let edits: Edit[];
   try {
-    edits = kind === 'json' ? jsonEdits(text, lines) : [];
+    edits = kind === 'json' ? jsonEdits(text, lines) : kind === 'unified' ? unifiedEdits(lines, strict) : kind === 'v4a' ? v4aEdits(lines, strict) : searchEdits(lines, strict);
     if (edits.length === 0) throw new Exit2('error: parse 1');
   } catch (e) {
     if (e instanceof Exit2) return { code: 2, out: [e.line] };
@@ -202,22 +426,32 @@ function run(args: string[]): { code: number; out: string[] } {
   const fails: Fail[] = [];
   for (const edit of edits) {
     const before = new Map(tree.now);
+    const moveCount = tree.moves.length;
     try {
       edit(tree);
     } catch (e) {
       if (!(e instanceof Fail)) throw e;
       tree.now.clear();
+      tree.moves.length = moveCount;
       for (const [k, v] of before) tree.now.set(k, v);
       fails.push(e);
     }
   }
   if (fails.length > 0) return { code: 1, out: [...fails.map((f) => `error: ${f.code} ${f.path}`), `failed: ${fails.length} of ${edits.length} edits`] };
   const rows: string[] = [];
+  const renames = new Map<string, string>();
+  const consumed = new Set<string>();
+  for (const [old, dest] of tree.moves) {
+    if (!consumed.has(old) && !consumed.has(dest) && tree.original(old) !== null && tree.get(old) === null && tree.original(dest) === null && tree.get(dest) !== null) {
+      renames.set(dest, old); consumed.add(old); consumed.add(dest);
+    }
+  }
   for (const p of [...tree.now.keys()].sort((a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b)))) {
     const was = tree.original(p);
     const now = tree.now.get(p)!;
     if (was === now) continue;
-    rows.push(`${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}`);
+    if (renames.has(p)) rows.push(`R ${renames.get(p)} -> ${p}`);
+    else if (!consumed.has(p)) rows.push(`${was === null ? 'A' : now === null ? 'D' : 'M'} ${p}`);
     if (check) continue;
     if (now === null) rmSync(p, { force: true });
     else {
